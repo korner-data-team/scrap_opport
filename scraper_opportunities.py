@@ -47,26 +47,33 @@ def init_driver():
 
     return driver
 
-
 def get_table_1(driver) -> pd.DataFrame:
     """Fetch hotel count for dynamically generated check-in/check-out dates."""
     current_date = datetime.now()
     results = []
+    MAX_RETRIES = 3  # Maximum number of retries if hotel count is zero
 
-    for i in range(180):  # Generate 5 date ranges
+    for i in range(180):  # Generate date ranges
         check_in = (current_date + timedelta(days=i)).strftime("%Y-%m-%d")
         check_out = (current_date + timedelta(days=i + 1)).strftime("%Y-%m-%d")
+        hotels_count = 0
 
-        url = f"https://www.booking.com/searchresults.fr.html?ss=Paris&checkin={check_in}&checkout={check_out}&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
-        driver.get(url)
-        time.sleep(random.uniform(3, 8))  # Random delay
+        for attempt in range(1, MAX_RETRIES + 1):
+            url = f"https://www.booking.com/searchresults.fr.html?ss=Paris&checkin={check_in}&checkout={check_out}&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
+            driver.get(url)
+            time.sleep(random.uniform(3, 8))  # Random delay
 
-        try:
-            search_hotels = driver.find_element(By.CLASS_NAME, DIV_CLASS_NAME).text
-            hotels_count = int(re.sub(r"[^0-9]", "", search_hotels))  # Extract only numbers
-        except NoSuchElementException:
-            print(f"[ERROR] Element not found for {check_in} - {check_out}")
-            hotels_count = 0
+            try:
+                search_hotels = driver.find_element(By.CLASS_NAME, DIV_CLASS_NAME).text
+                hotels_count = int(re.sub(r"[^0-9]", "", search_hotels))
+            except NoSuchElementException:
+                print(f"[ERROR] Element not found for {check_in} - {check_out}")
+
+            if hotels_count > 0:
+                break  # Successfully retrieved a non-zero count, break retry loop
+            else:
+                print(f"[RETRY] Attempt {attempt} failed: 0 hotels found for {check_in} - {check_out}")
+                time.sleep(2)  # Optional: extra wait before retrying
 
         results.append(
             {

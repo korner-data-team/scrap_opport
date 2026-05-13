@@ -216,13 +216,9 @@ def get_table_2(driver) -> pd.DataFrame:
     """Fetch the summary hotel count for the original fixed URL."""
     fixed_url = (
         "https://www.booking.com/searchresults.fr.html"
-        "?label=metagha-link-LUFR-hotel-470750_dev-desktop_los-1_bw-2_dow-Friday"
-        "_defdate-1_room-0_gstadt-2_rateid-public_aud-0_gacid-17490061106_mcid-10"
-        "_ppa-1_clrid-0_ad-1_gstkid-0_checkin-20240628_ppt-"
-        "&sid=0eb90c0c3d736f438381a1729cf346ef&aid=356931&ss=Paris&ssne=Paris"
-        "&ssne_untouched=Paris&efdco=1&lang=en-gb&src=searchresults"
-        "&dest_id=-1456928&dest_type=city&checkin=2024-11-06&checkout=2024-11-07"
-        "&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
+        "?ss=Paris&dest_id=-1456928&dest_type=city"
+        "&group_adults=2&no_rooms=1&group_children=0"
+        "&nflt=ht_id%3D204"
     )
 
     hotels_count = fetch_hotel_count(driver, fixed_url)

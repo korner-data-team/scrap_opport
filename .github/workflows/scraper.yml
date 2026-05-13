@@ -32,6 +32,8 @@ jobs:
 
       - name: Setup Chrome for Selenium
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
 
       - name: Create Google Services JSON File
         run: |

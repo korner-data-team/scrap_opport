@@ -1,38 +1,11 @@
-# Core packages
+# Core data
 pandas
 pandas-gbq
 numpy
 
-# Google Cloud
+# Google Cloud (BigQuery upload)
 google-cloud-bigquery
-google-cloud-core
-google-auth
-google-api-core
-googleapis-common-protos
-google-cloud-storage
-protobuf
-grpcio
-google-resumable-media
-google-crc32c
-google-cloud-bigquery-storage
 
-# Utility libraries
-python-dateutil
-pytz
-six
-typing-extensions
-certifi
-idna
-urllib3
-requests
-pyasn1
-pyasn1-modules
-rsa
-cachetools
-packaging
-pyarrow
-db_dtypes
-websocket-client
-
-# Selenium
-selenium
+# Scraping
+undetected-chromedriver
+beautifulsoup4

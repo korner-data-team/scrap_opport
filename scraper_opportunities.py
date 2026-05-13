@@ -17,6 +17,7 @@ If Booking changes ONE thing, the others still work.
 import random
 import re
 import time
+import subprocess
 import pandas as pd
 import pandas_gbq
 import undetected_chromedriver as uc
@@ -144,7 +145,14 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
-    return uc.Chrome(options=options)
+    try:
+        chrome_version = subprocess.check_output(
+            ["google-chrome", "--version"], text=True
+        )
+        major_version = int(chrome_version.split()[-1].split(".")[0])
+        return uc.Chrome(options=options, version_main=major_version)
+    except Exception:
+        return uc.Chrome(options=options)
 
 
 def build_url(check_in: str, check_out: str) -> str:

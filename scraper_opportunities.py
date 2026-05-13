@@ -1,128 +1,249 @@
-import json
-import os
+"""
+Booking.com Paris hotel availability scraper.
+
+Uses undetected-chromedriver to bypass AWS WAF, and a robust multi-strategy
+parser that survives Booking.com changing their wording (which they do every
+few months).
+
+The parser tries 4 strategies in order:
+  1. <h1> aria-label
+  2. <h1> visible text
+  3. <title> tag
+  4. Scan of headings/divs/spans
+
+If Booking changes ONE thing, the others still work.
+"""
+
 import random
 import re
 import time
 import pandas as pd
 import pandas_gbq
+import undetected_chromedriver as uc
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
 from google.cloud import bigquery
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
 
 
-# Constants
-DIV_CLASS_NAME = "d4a98186ec"
-URL = "https://www.booking.com/searchresults.fr.html?label=metagha-link-LUFR-hotel-470750_dev-desktop_los-1_bw-2_dow-Friday_defdate-1_room-0_gstadt-2_rateid-public_aud-0_gacid-17490061106_mcid-10_ppa-1_clrid-0_ad-1_gstkid-0_checkin-20240628_ppt-&sid=0eb90c0c3d736f438381a1729cf346ef&aid=356931&ss=Paris&ssne=Paris&ssne_untouched=Paris&efdco=1&lang=en-gb&src=searchresults&dest_id=-1456928&dest_type=city&checkin=2024-11-06&checkout=2024-11-07&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
+# ---- BigQuery config ----
 PROJECT_ID = "korner-datalake"
 TABLE_ID_1 = "KornerScraper_HotelsAvailability.Arrondissement"
 TABLE_ID_2 = "KornerScraper_HotelsAvailability.ArrondissementSummary"
 
-# Initialize BigQuery Client
+# ---- Scraper config ----
+BASE_URL = "https://www.booking.com/searchresults.fr.html"
+DAYS_TO_SCRAPE = 180
+MAX_RETRIES = 3
 
+
+# ---- Robust parser ----
+# Words signalling "this is a hotel count" — add to this list if you see new ones.
+COUNT_NOUNS = [
+    "établissements?",   # "1 530 établissements trouvés"
+    "hébergements?",     # "Nous avons trouvé 1 566 hébergements"
+    "hôtels?",
+    "logements?",
+    "propriétés?",
+    "places?",
+    "properties",
+    "hotels",
+    "stays",
+    "accommodations?",
+]
+COUNT_NOUNS_RE = "|".join(COUNT_NOUNS)
+
+# Verbs signalling "X was found"
+COUNT_VERBS = ["trouvé", "trouve", "trouvés", "trouvées", "found"]
+COUNT_VERBS_RE = "|".join(COUNT_VERBS)
+
+# A number with optional French/English thousands separators (space, nbsp, comma, dot).
+NUMBER_RE = r"(\d[\d\s\xa0,\.]{0,8}\d|\d)"
+
+
+def _parse_int(raw: str):
+    """Convert '1 566' / '1,566' / '1.566' into 1566. Return None if invalid."""
+    if not raw:
+        return None
+    digits = re.sub(r"[^\d]", "", raw)
+    if not digits:
+        return None
+    n = int(digits)
+    # Sanity bounds for Paris hotel counts (with ht_id=204 filter).
+    if 10 <= n <= 100000:
+        return n
+    return None
+
+
+def _search_patterns(text: str):
+    """Try several regex patterns; return the first valid count, else None."""
+    if not text:
+        return None
+
+    patterns = [
+        # "trouvé 1 566 hébergements" (verb + number + noun) — most specific
+        rf"(?:{COUNT_VERBS_RE})\s+{NUMBER_RE}\s+(?:{COUNT_NOUNS_RE})",
+        # "1 566 hébergements trouvés" (number + noun + verb)
+        rf"{NUMBER_RE}\s+(?:{COUNT_NOUNS_RE})\s+(?:{COUNT_VERBS_RE})",
+        # "1 530 établissements" (number + noun, no verb)
+        rf"{NUMBER_RE}\s+(?:{COUNT_NOUNS_RE})",
+        # "trouvé 1 566" (verb + number, no noun)
+        rf"(?:{COUNT_VERBS_RE})\s+{NUMBER_RE}",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            count = _parse_int(match.group(1))
+            if count is not None:
+                return count
+    return None
+
+
+def extract_hotel_count(html: str) -> int:
+    """Extract hotel count from a Booking.com search results page."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strategy 1: <h1> aria-label (most stable)
+    for h1 in soup.find_all("h1", attrs={"aria-label": True}):
+        count = _search_patterns(h1["aria-label"])
+        if count is not None:
+            return count
+
+    # Strategy 2: <h1> visible text
+    for h1 in soup.find_all("h1"):
+        count = _search_patterns(h1.get_text())
+        if count is not None:
+            return count
+
+    # Strategy 3: <title>
+    title = soup.find("title")
+    if title:
+        count = _search_patterns(title.get_text())
+        if count is not None:
+            return count
+
+    # Strategy 4: scan headings, divs, and spans for matching text
+    for tag in soup.find_all(["h2", "h3", "div", "span"], limit=200):
+        text = tag.get_text(strip=True)
+        if 5 < len(text) < 200:
+            count = _search_patterns(text)
+            if count is not None:
+                return count
+
+    return 0
+
+
+# ---- Browser & scraping ----
 def init_driver():
-    """Create and return a headless Selenium WebDriver instance with proper options."""
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--no-sandbox")  # Bypass OS security
-    chrome_options.add_argument("--disable-dev-shm-usage")  # Prevent limited resource issues
-    chrome_options.add_argument("--disable-gpu")  # Fix headless GPU rendering issues
-    chrome_options.add_argument("--window-size=1920,1080")  # Ensure full page rendering
+    """Create and return a stealth Chrome WebDriver instance."""
+    options = uc.ChromeOptions()
+    # options.add_argument("--headless=new")  # disabled — Booking detects this
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    return uc.Chrome(options=options)
 
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")  # Prevent bot detection
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])  # Hide automation flag
-    chrome_options.add_experimental_option("useAutomationExtension", False)
 
-    chrome_options.add_argument("--log-level=3")
-
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+def build_url(check_in: str, check_out: str) -> str:
+    return (
+        f"{BASE_URL}?ss=Paris&checkin={check_in}&checkout={check_out}"
+        f"&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
     )
 
-    return driver
+
+def fetch_hotel_count(driver, url: str) -> int:
+    """Load a search URL with retries and parse the hotel count."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            driver.get(url)
+            # Wait until the h1 with the count appears (max 10s).
+            # On a normal load this returns in ~1-2s; only WAF challenges take longer.
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "h1"))
+                )
+                # Tiny extra wait for aria-label to populate
+                time.sleep(0.5)
+            except Exception:
+                pass  # let extract_hotel_count handle it
+            
+            count = extract_hotel_count(driver.page_source)
+            if count > 0:
+                return count
+            print(f"  [RETRY {attempt}] parsed 0 hotels")
+        except Exception as e:
+            print(f"  [RETRY {attempt}] error: {e}")
+        time.sleep(2 + attempt)
+    return 0
+
 
 def get_table_1(driver) -> pd.DataFrame:
-    """Fetch hotel count for dynamically generated check-in/check-out dates."""
+    """Fetch hotel count for the next 180 days of one-night stays in Paris."""
     current_date = datetime.now()
     results = []
-    MAX_RETRIES = 3  # Maximum number of retries if hotel count is zero
 
-    for i in range(180):  # Generate date ranges
+    for i in range(DAYS_TO_SCRAPE):
         check_in = (current_date + timedelta(days=i)).strftime("%Y-%m-%d")
         check_out = (current_date + timedelta(days=i + 1)).strftime("%Y-%m-%d")
-        hotels_count = 0
+        url = build_url(check_in, check_out)
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            url = f"https://www.booking.com/searchresults.fr.html?ss=Paris&checkin={check_in}&checkout={check_out}&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
-            driver.get(url)
-            time.sleep(random.uniform(3, 8))  # Random delay
+        hotels_count = fetch_hotel_count(driver, url)
+        print(f"[OK] {check_in} → {hotels_count} hotels")
 
-            try:
-                search_hotels = driver.find_element(By.CLASS_NAME, DIV_CLASS_NAME).text
-                hotels_count = int(re.sub(r"[^0-9]", "", search_hotels))
-            except NoSuchElementException:
-                print(f"[ERROR] Element not found for {check_in} - {check_out}")
+        results.append({
+            "ObservationDate": current_date.strftime("%Y-%m-%d"),
+            "CheckInDate": check_in,
+            "PropertiesCount": hotels_count,
+        })
 
-            if hotels_count > 0:
-                break  # Successfully retrieved a non-zero count, break retry loop
-            else:
-                print(f"[RETRY] Attempt {attempt} failed: 0 hotels found for {check_in} - {check_out}")
-                time.sleep(2)  # Optional: extra wait before retrying
-
-        results.append(
-            {
-                "ObservationDate": current_date.strftime("%Y-%m-%d"),
-                "CheckInDate": check_in,
-                "PropertiesCount": hotels_count,
-            }
-        )
+        time.sleep(random.uniform(0.5, 1.5))
 
     return pd.DataFrame(results)
 
 
 def get_table_2(driver) -> pd.DataFrame:
-    """Fetch the number of hotels listed on a given Booking.com search results page."""
-    results = []
-    driver.get(URL)
+    """Fetch the summary hotel count for the original fixed URL."""
+    fixed_url = (
+        "https://www.booking.com/searchresults.fr.html"
+        "?label=metagha-link-LUFR-hotel-470750_dev-desktop_los-1_bw-2_dow-Friday"
+        "_defdate-1_room-0_gstadt-2_rateid-public_aud-0_gacid-17490061106_mcid-10"
+        "_ppa-1_clrid-0_ad-1_gstkid-0_checkin-20240628_ppt-"
+        "&sid=0eb90c0c3d736f438381a1729cf346ef&aid=356931&ss=Paris&ssne=Paris"
+        "&ssne_untouched=Paris&efdco=1&lang=en-gb&src=searchresults"
+        "&dest_id=-1456928&dest_type=city&checkin=2024-11-06&checkout=2024-11-07"
+        "&group_adults=2&no_rooms=1&group_children=0&nflt=ht_id%3D204"
+    )
+
+    hotels_count = fetch_hotel_count(driver, fixed_url)
     current_date = datetime.now().strftime("%Y-%m-%d")
-    time.sleep(random.uniform(5, 10))  # Delay to allow full page load
 
-    try:
-        search_hotels = driver.find_element(By.CLASS_NAME, DIV_CLASS_NAME).text
-        hotels_count = int(re.sub(r"[^0-9]", "", search_hotels)) if search_hotels else 0
-        results.append(
-            {"ObservationDate": current_date, "PropertiesCount": hotels_count}
-        )
-    except NoSuchElementException:
-        print(f"[ERROR] Element not found on {URL}")
-
-    return pd.DataFrame(results)
-
+    return pd.DataFrame(
+        [{"ObservationDate": current_date, "PropertiesCount": hotels_count}]
+    )
 
 def booking_properties_to_bq():
     """Fetch properties data and load it into BigQuery."""
-    client = bigquery.Client()  # Google Cloud BigQuery client
     driver = init_driver()
-
-    # Get data tables
-    df_table_1 = get_table_1(driver)
-    df_table_2 = get_table_2(driver)
-
-    # # Insert data into BigQuery
+ 
     try:
-        pandas_gbq.to_gbq(df_table_1, TABLE_ID_1, project_id=PROJECT_ID, if_exists="append")
-        pandas_gbq.to_gbq(df_table_2, TABLE_ID_2, project_id=PROJECT_ID, if_exists="append")
-        print("Data successfully uploaded to BigQuery.")
-    except Exception as e:
-        print(f"An error occurred while uploading to BigQuery: {e}")
-
-    #Close the WebDriver
-    driver.quit()
-
+        df_table_1 = get_table_1(driver)
+        df_table_2 = get_table_2(driver)
+ 
+        try:
+            pandas_gbq.to_gbq(
+                df_table_1, TABLE_ID_1, project_id=PROJECT_ID, if_exists="append"
+            )
+            pandas_gbq.to_gbq(
+                df_table_2, TABLE_ID_2, project_id=PROJECT_ID, if_exists="append"
+            )
+            print("Data successfully uploaded to BigQuery.")
+        except Exception as e:
+            print(f"An error occurred while uploading to BigQuery: {e}")
+    finally:
+        driver.quit()
+ 
+ 
 booking_properties_to_bq()

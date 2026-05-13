@@ -2,26 +2,28 @@ name: Scheduled Booking Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Daily at 6:00 UTC
+    - cron: '0 3 * * *'  # Daily at 3:00 UTC
   workflow_dispatch:
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+    timeout-minutes: 33  # safety net — kills the job if it hangs
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # bumped from v3 (Node 20 deprecation)
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # bumped from v4 (Node 20 deprecation)
         with:
           python-version: 3.11
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential python3-dev python3-pip
+          sudo apt-get install -y build-essential python3-dev python3-pip xvfb
+          # xvfb = virtual display for the (non-headless) Chrome browser
 
       - name: Upgrade pip, setuptools, wheel and install numpy from wheel
         run: |
@@ -32,7 +34,6 @@ jobs:
         run: |
           pip install -r requirements.txt --no-deps
           pip install pandas-gbq pydata-google-auth charset-normalizer
-
 
       - name: Setup Chrome for Selenium
         uses: browser-actions/setup-chrome@v1
@@ -48,4 +49,6 @@ jobs:
       - name: Run scraper script
         env:
           GOOGLE_APPLICATION_CREDENTIALS: google-services.json
-        run: python scraper_opportunities.py
+        run: xvfb-run -a python scraper_opportunities.py
+        # xvfb-run wraps the script in a virtual display so non-headless
+        # Chrome thinks it has a screen to render on.
